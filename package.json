@@ -1,0 +1,26 @@
+{
+  "name": "trusted-gemlab-mobile-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "prisma:generate": "prisma generate"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@prisma/client": "^6.16.2",
+    "bcryptjs": "^3.0.3",
+    "fastify": "^5.2.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^20",
+    "prisma": "^6.16.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5"
+  }
+}

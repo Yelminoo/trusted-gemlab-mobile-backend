@@ -1,0 +1,748 @@
+import cors from '@fastify/cors';
+import { PrismaClient } from '@prisma/client';
+import Fastify, { FastifyRequest } from 'fastify';
+
+import {
+  hashPassword,
+  signAccessToken,
+  signRefreshToken,
+  verifyAdminToken,
+  verifyCustomerToken,
+  verifyPassword,
+} from './auth';
+import { formatMemberId, parseMemberId } from './memberId';
+import { generateOtp, hashOtp, otpExpiresAt, sendOtpEmail, withinResendCooldown } from './otp';
+
+const prisma = new PrismaClient();
+const app = Fastify({ logger: true });
+
+function getCustomerSession(request: FastifyRequest) {
+  const authHeader = request.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : null;
+  return token ? verifyCustomerToken(token) : null;
+}
+
+// Staff session: either a User (staff-only username/password) token, OR a
+// Customer token whose account has isAdmin === true. There is no separate
+// admin login in the mobile app — an isAdmin-flagged customer gets admin
+// access through their SAME email+password session (see Customer.isAdmin's
+// comment in schema.prisma). Requires a DB lookup for the customer case
+// because the JWT payload itself doesn't carry isAdmin (it can change after
+// the token was issued).
+type StaffSession = { type: 'admin'; id: number } | { type: 'customer'; id: number };
+
+async function getStaffSession(request: FastifyRequest): Promise<StaffSession | null> {
+  const authHeader = request.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : null;
+  if (!token) return null;
+
+  const adminSession = verifyAdminToken(token);
+  if (adminSession) {
+    return { type: 'admin', id: Number(adminSession.sub) };
+  }
+
+  const customerSession = verifyCustomerToken(token);
+  if (customerSession) {
+    const customer = await prisma.customer.findUnique({
+      where: { id: Number(customerSession.sub) },
+      select: { isAdmin: true },
+    });
+    if (customer?.isAdmin) {
+      return { type: 'customer', id: Number(customerSession.sub) };
+    }
+  }
+
+  return null;
+}
+
+// A customer's personal override wins; otherwise the system-wide default
+// (seeded to 100, editable via web-internal's /dashboard/points).
+async function getEffectiveFreeCertificateCost(customerFreeCertificateCost: number | null): Promise<number> {
+  if (customerFreeCertificateCost != null) return customerFreeCertificateCost;
+  const setting = await prisma.systemSetting.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
+  return setting.freeCertificateCost;
+}
+
+app.register(cors, { origin: true });
+
+app.get('/health', async () => {
+  await prisma.$queryRaw`SELECT 1`;
+  return { status: 'ok', db: 'ok', timestamp: new Date().toISOString() };
+});
+
+// GET /app-version — public, no auth (must work before login so an
+// out-of-date user can be told before they even try to sign in).
+// Informational only, admin-edited via web-internal's /dashboard/points.
+app.get('/app-version', async () => {
+  const setting = await prisma.systemSetting.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
+  return { latestVersion: setting.latestAppVersion };
+});
+
+// ---- Admin auth (backend implemented; no mobile screen yet, see docs/REQUIREMENTS.md 2.1) ----
+
+app.post<{ Body: { username?: string; password?: string } }>('/auth/login', async (request, reply) => {
+  const { username, password } = request.body ?? {};
+  if (!username || !password) {
+    return reply.code(401).send({ error: 'Invalid credentials' });
+  }
+
+  const user = await prisma.user.findUnique({ where: { username } });
+  if (!user || !(await verifyPassword(password, user.password))) {
+    return reply.code(401).send({ error: 'Invalid credentials' });
+  }
+
+  const payload = { kind: 'admin' as const, sub: String(user.id), username: user.username, role: user.role };
+  return {
+    accessToken: signAccessToken(payload),
+    refreshToken: signRefreshToken(payload),
+    user: { id: user.id, username: user.username, role: user.role },
+  };
+});
+
+app.post<{ Body: { refreshToken?: string } }>('/auth/refresh', async (request, reply) => {
+  const { refreshToken } = request.body ?? {};
+  const session = refreshToken ? verifyAdminToken(refreshToken) : null;
+  if (!session) {
+    return reply.code(401).send({ error: 'Invalid or expired refresh token' });
+  }
+  return { accessToken: signAccessToken(session) };
+});
+
+// ---- Customer auth + wallet (mobile — docs/REQUIREMENTS.md 2.4) ----
+
+app.post<{ Body: { email?: string; password?: string } }>('/customer/register', async (request, reply) => {
+  const { email, password } = request.body ?? {};
+  if (!email || !password || password.length < 8) {
+    return reply.code(400).send({ error: 'email and a password of at least 8 characters are required' });
+  }
+
+  const existing = await prisma.customer.findUnique({ where: { email } });
+  if (existing) {
+    return reply.code(409).send({ error: 'Email already registered' });
+  }
+
+  const customer = await prisma.customer.create({
+    data: {
+      email,
+      password: await hashPassword(password),
+      wallet: { create: {} },
+    },
+  });
+
+  const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
+  return reply.code(201).send({
+    accessToken: signAccessToken(payload),
+    refreshToken: signRefreshToken(payload),
+    customer: { id: customer.id, email: customer.email, isAdmin: customer.isAdmin },
+  });
+});
+
+app.post<{ Body: { email?: string; password?: string } }>('/customer/login', async (request, reply) => {
+  const { email, password } = request.body ?? {};
+  if (!email || !password) {
+    return reply.code(401).send({ error: 'Invalid credentials' });
+  }
+
+  const customer = await prisma.customer.findUnique({ where: { email } });
+  if (!customer || !(await verifyPassword(password, customer.password))) {
+    return reply.code(401).send({ error: 'Invalid credentials' });
+  }
+
+  const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
+  return {
+    accessToken: signAccessToken(payload),
+    refreshToken: signRefreshToken(payload),
+    customer: { id: customer.id, email: customer.email, isAdmin: customer.isAdmin },
+  };
+});
+
+app.get('/customer/wallet', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  const wallet = await prisma.wallet.findUnique({
+    where: { customerId: Number(session.sub) },
+    include: {
+      transactions: { orderBy: { createdAt: 'desc' }, take: 50 },
+      customer: { select: { freeCertificateCost: true } },
+    },
+  });
+  if (!wallet) {
+    return reply.code(404).send({ error: 'Wallet not found' });
+  }
+
+  return {
+    balance: wallet.balance,
+    lifetimeEarned: wallet.lifetimeEarned,
+    freeCertificateCost: await getEffectiveFreeCertificateCost(wallet.customer.freeCertificateCost),
+    transactions: wallet.transactions.map((t) => ({
+      id: t.id,
+      type: t.type,
+      amount: t.amount,
+      balanceAfter: t.balanceAfter,
+      note: t.note,
+      createdAt: t.createdAt,
+    })),
+  };
+});
+
+// ---- Password reset (no auth — proves identity via emailed OTP) ----
+
+const GENERIC_REQUEST_MESSAGE = 'If that email is registered, a code has been sent.';
+
+app.post<{ Body: { email?: string } }>('/customer/password-reset/request', async (request, reply) => {
+  const { email } = request.body ?? {};
+  if (!email) {
+    return reply.code(400).send({ error: 'email is required' });
+  }
+
+  const customer = await prisma.customer.findUnique({ where: { email } });
+  // Always return the same generic response whether or not the email exists —
+  // otherwise this endpoint becomes an account-enumeration oracle.
+  if (customer) {
+    const recent = await prisma.customerOtp.findFirst({
+      where: { customerId: customer.id, purpose: 'password_reset' },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!recent || !withinResendCooldown(recent.createdAt)) {
+      const otp = generateOtp();
+      await prisma.customerOtp.create({
+        data: {
+          customerId: customer.id,
+          purpose: 'password_reset',
+          otpHash: hashOtp(otp),
+          expiresAt: otpExpiresAt(),
+        },
+      });
+      sendOtpEmail(customer.email, otp, 'password_reset');
+    }
+  }
+
+  return { message: GENERIC_REQUEST_MESSAGE };
+});
+
+app.post<{ Body: { email?: string; otp?: string; newPassword?: string } }>(
+  '/customer/password-reset/confirm',
+  async (request, reply) => {
+    const { email, otp, newPassword } = request.body ?? {};
+    if (!email || !otp || !newPassword || newPassword.length < 8) {
+      return reply.code(400).send({ error: 'email, otp, and a newPassword of at least 8 characters are required' });
+    }
+
+    const customer = await prisma.customer.findUnique({ where: { email } });
+    const record = customer
+      ? await prisma.customerOtp.findFirst({
+          where: {
+            customerId: customer.id,
+            purpose: 'password_reset',
+            usedAt: null,
+            expiresAt: { gt: new Date() },
+            otpHash: hashOtp(otp),
+          },
+          orderBy: { createdAt: 'desc' },
+        })
+      : null;
+
+    if (!customer || !record) {
+      return reply.code(400).send({ error: 'Invalid or expired code' });
+    }
+
+    await prisma.$transaction([
+      prisma.customer.update({ where: { id: customer.id }, data: { password: await hashPassword(newPassword) } }),
+      prisma.customerOtp.updateMany({
+        where: { customerId: customer.id, purpose: 'password_reset', usedAt: null },
+        data: { usedAt: new Date() },
+      }),
+    ]);
+
+    return { message: 'Password updated' };
+  }
+);
+
+// ---- Email change (authenticated — OTP sent to the NEW address to prove ownership) ----
+
+app.post<{ Body: { newEmail?: string } }>('/customer/email-change/request', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  const { newEmail } = request.body ?? {};
+  if (!newEmail || !newEmail.includes('@')) {
+    return reply.code(400).send({ error: 'A valid newEmail is required' });
+  }
+
+  const taken = await prisma.customer.findUnique({ where: { email: newEmail } });
+  if (taken) {
+    return reply.code(409).send({ error: 'Email already in use' });
+  }
+
+  const customerId = Number(session.sub);
+  const recent = await prisma.customerOtp.findFirst({
+    where: { customerId, purpose: 'email_change' },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!recent || !withinResendCooldown(recent.createdAt)) {
+    const otp = generateOtp();
+    await prisma.customerOtp.create({
+      data: {
+        customerId,
+        purpose: 'email_change',
+        otpHash: hashOtp(otp),
+        newEmail,
+        expiresAt: otpExpiresAt(),
+      },
+    });
+    sendOtpEmail(newEmail, otp, 'email_change');
+  }
+
+  return { message: `A code has been sent to ${newEmail}.` };
+});
+
+app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  const { otp } = request.body ?? {};
+  if (!otp) {
+    return reply.code(400).send({ error: 'otp is required' });
+  }
+
+  const customerId = Number(session.sub);
+  const record = await prisma.customerOtp.findFirst({
+    where: {
+      customerId,
+      purpose: 'email_change',
+      usedAt: null,
+      expiresAt: { gt: new Date() },
+      otpHash: hashOtp(otp),
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!record || !record.newEmail) {
+    return reply.code(400).send({ error: 'Invalid or expired code' });
+  }
+
+  try {
+    const customer = await prisma.$transaction(async (tx) => {
+      const updated = await tx.customer.update({
+        where: { id: customerId },
+        data: { email: record.newEmail! },
+      });
+      await tx.customerOtp.updateMany({
+        where: { customerId, purpose: 'email_change', usedAt: null },
+        data: { usedAt: new Date() },
+      });
+      return updated;
+    });
+    return { customer: { id: customer.id, email: customer.email } };
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: string }).code : undefined;
+    if (code === 'P2002') {
+      return reply.code(409).send({ error: 'Email already in use' });
+    }
+    throw error;
+  }
+});
+
+// ---- Free certificate requests (customer side) ----
+//
+// Points are NOT deducted on submission — only when an admin approves (see
+// the admin section below). A customer can only have one pending request at
+// a time (guard against spamming the admin queue).
+
+app.get('/customer/certificate-requests', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const requests = await prisma.certificateRequest.findMany({
+    where: { customerId: Number(session.sub) },
+    orderBy: { createdAt: 'desc' },
+  });
+  return { requests };
+});
+
+app.post<{ Body: { customerNote?: string } }>('/customer/certificate-requests', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const customerId = Number(session.sub);
+
+  const [customer, existingPending] = await Promise.all([
+    prisma.customer.findUnique({
+      where: { id: customerId },
+      select: { freeCertificateCost: true, wallet: { select: { balance: true } } },
+    }),
+    prisma.certificateRequest.findFirst({ where: { customerId, status: 'pending' } }),
+  ]);
+  if (!customer?.wallet) {
+    return reply.code(404).send({ error: 'Wallet not found' });
+  }
+  if (existingPending) {
+    return reply.code(409).send({ error: 'You already have a pending certificate request' });
+  }
+
+  const cost = await getEffectiveFreeCertificateCost(customer.freeCertificateCost);
+  if (customer.wallet.balance < cost) {
+    return reply.code(400).send({ error: `You need at least ${cost} points to request a free certificate` });
+  }
+
+  const { customerNote } = request.body ?? {};
+  const created = await prisma.certificateRequest.create({
+    data: { customerId, pointsCost: cost, customerNote: customerNote?.trim() || null },
+  });
+  return reply.code(201).send({ request: created });
+});
+
+// ---- Admin: member lookup, credit adjustment, member history, request review ----
+//
+// Mirrors web-internal's /api/customers, /api/customers/:id/points, and
+// /api/certificate-requests — same tables, same atomic-transaction logic,
+// independently implemented here per the two-backends-one-DB architecture
+// (see TECHSTACK.md). This is what the mobile app's Admin tab calls.
+
+app.get<{ Querystring: { search?: string; memberId?: string } }>('/admin/members', async (request, reply) => {
+  const session = await getStaffSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  const { search, memberId } = request.query;
+  const scannedId = memberId ? parseMemberId(memberId) : search ? parseMemberId(search) : null;
+
+  const customers = await prisma.customer.findMany({
+    where: scannedId
+      ? { id: scannedId }
+      : search
+        ? { email: { contains: search, mode: 'insensitive' } }
+        : {},
+    select: { id: true, email: true, createdAt: true, wallet: { select: { balance: true, lifetimeEarned: true } } },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
+  return { members: customers.map((c) => ({ ...c, memberId: formatMemberId(c.id) })) };
+});
+
+app.get<{ Params: { id: string } }>('/admin/members/:id', async (request, reply) => {
+  const session = await getStaffSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const customerId = parseInt(request.params.id, 10);
+  if (isNaN(customerId)) {
+    return reply.code(400).send({ error: 'Invalid member id' });
+  }
+
+  const customer = await prisma.customer.findUnique({
+    where: { id: customerId },
+    select: {
+      id: true,
+      email: true,
+      freeCertificateCost: true,
+      wallet: {
+        select: {
+          balance: true,
+          lifetimeEarned: true,
+          transactions: { orderBy: { createdAt: 'desc' }, take: 100 },
+        },
+      },
+    },
+  });
+  if (!customer) {
+    return reply.code(404).send({ error: 'Member not found' });
+  }
+
+  return {
+    ...customer,
+    memberId: formatMemberId(customer.id),
+    effectiveFreeCertificateCost: await getEffectiveFreeCertificateCost(customer.freeCertificateCost),
+  };
+});
+
+app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?: string } }>(
+  '/admin/members/:id/points',
+  async (request, reply) => {
+    const session = await getStaffSession(request);
+    if (!session) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    const customerId = parseInt(request.params.id, 10);
+    if (isNaN(customerId)) {
+      return reply.code(400).send({ error: 'Invalid member id' });
+    }
+
+    const { type, amount, note } = request.body ?? {};
+    if (type !== 'credit' && type !== 'debit') {
+      return reply.code(400).send({ error: 'type must be "credit" or "debit"' });
+    }
+    if (typeof amount !== 'number' || !Number.isInteger(amount) || amount <= 0) {
+      return reply.code(400).send({ error: 'amount must be a positive integer' });
+    }
+    if (typeof note !== 'string' || !note.trim()) {
+      return reply.code(400).send({ error: 'note is required' });
+    }
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const wallet = await tx.wallet.findUnique({ where: { customerId } });
+        if (!wallet) throw new Error('WALLET_NOT_FOUND');
+
+        const delta = type === 'credit' ? amount : -amount;
+        const newBalance = wallet.balance + delta;
+        if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
+
+        const updatedWallet = await tx.wallet.update({
+          where: { id: wallet.id },
+          data: {
+            balance: newBalance,
+            lifetimeEarned: type === 'credit' ? wallet.lifetimeEarned + amount : wallet.lifetimeEarned,
+          },
+        });
+        const transaction = await tx.walletTransaction.create({
+          data: {
+            walletId: wallet.id,
+            type,
+            amount,
+            balanceAfter: newBalance,
+            note: note.trim(),
+            initiatedBy: session.type === 'admin' ? session.id : null,
+            initiatedByCustomerId: session.type === 'customer' ? session.id : null,
+          },
+        });
+        return { wallet: updatedWallet, transaction };
+      });
+
+      return {
+        wallet: { balance: result.wallet.balance, lifetimeEarned: result.wallet.lifetimeEarned },
+        transaction: result.transaction,
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
+        return reply.code(404).send({ error: 'Member or wallet not found' });
+      }
+      if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
+        return reply.code(400).send({ error: 'Insufficient balance for this deduction' });
+      }
+      throw error;
+    }
+  }
+);
+
+app.get<{ Querystring: { status?: string } }>('/admin/certificate-requests', async (request, reply) => {
+  const session = await getStaffSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const { status } = request.query;
+  const requests = await prisma.certificateRequest.findMany({
+    where: status ? { status } : {},
+    include: { customer: { select: { id: true, email: true } } },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  });
+  return {
+    requests: requests.map((r) => ({ ...r, customer: { ...r.customer, memberId: formatMemberId(r.customer.id) } })),
+  };
+});
+
+app.patch<{ Params: { id: string }; Body: { decision?: string; adminNote?: string } }>(
+  '/admin/certificate-requests/:id',
+  async (request, reply) => {
+    const session = await getStaffSession(request);
+    if (!session) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    const requestId = parseInt(request.params.id, 10);
+    if (isNaN(requestId)) {
+      return reply.code(400).send({ error: 'Invalid request id' });
+    }
+    const { decision, adminNote } = request.body ?? {};
+    if (decision !== 'approved' && decision !== 'rejected') {
+      return reply.code(400).send({ error: 'decision must be "approved" or "rejected"' });
+    }
+
+    try {
+      const updated = await prisma.$transaction(async (tx) => {
+        const certRequest = await tx.certificateRequest.findUnique({ where: { id: requestId } });
+        if (!certRequest) throw new Error('REQUEST_NOT_FOUND');
+        if (certRequest.status !== 'pending') throw new Error('ALREADY_REVIEWED');
+
+        if (decision === 'approved') {
+          const wallet = await tx.wallet.findUnique({ where: { customerId: certRequest.customerId } });
+          if (!wallet) throw new Error('WALLET_NOT_FOUND');
+          const newBalance = wallet.balance - certRequest.pointsCost;
+          if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
+
+          await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance } });
+          await tx.walletTransaction.create({
+            data: {
+              walletId: wallet.id,
+              type: 'debit',
+              amount: certRequest.pointsCost,
+              balanceAfter: newBalance,
+              note: 'Free certificate request approved',
+              certificateRequestId: certRequest.id,
+              initiatedBy: session.type === 'admin' ? session.id : null,
+              initiatedByCustomerId: session.type === 'customer' ? session.id : null,
+            },
+          });
+        }
+
+        return tx.certificateRequest.update({
+          where: { id: requestId },
+          data: {
+            status: decision,
+            adminNote: adminNote ?? null,
+            reviewedBy: session.type === 'admin' ? session.id : null,
+            reviewedByCustomerId: session.type === 'customer' ? session.id : null,
+            reviewedAt: new Date(),
+          },
+        });
+      });
+
+      return { request: updated };
+    } catch (error) {
+      if (error instanceof Error && error.message === 'REQUEST_NOT_FOUND') {
+        return reply.code(404).send({ error: 'Request not found' });
+      }
+      if (error instanceof Error && error.message === 'ALREADY_REVIEWED') {
+        return reply.code(400).send({ error: 'Request was already reviewed' });
+      }
+      if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
+        return reply.code(404).send({ error: 'Member wallet not found' });
+      }
+      if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
+        return reply.code(400).send({ error: 'Member no longer has enough balance for this request' });
+      }
+      throw error;
+    }
+  }
+);
+
+// GET /admin/activity-log — a combined, chronological feed of this admin's
+// own actions (points issued/deducted + certificate requests reviewed).
+// Read-only — nothing here can be edited or deleted, matches the append-only
+// ledger philosophy already used for wallet_transactions.
+app.get('/admin/activity-log', async (request, reply) => {
+  const session = await getStaffSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const transactionWhere = session.type === 'admin' ? { initiatedBy: session.id } : { initiatedByCustomerId: session.id };
+  const reviewedWhere =
+    session.type === 'admin' ? { reviewedBy: session.id } : { reviewedByCustomerId: session.id };
+
+  const [transactions, reviewedRequests] = await Promise.all([
+    prisma.walletTransaction.findMany({
+      where: transactionWhere,
+      include: { wallet: { include: { customer: { select: { id: true, email: true } } } } },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    }),
+    prisma.certificateRequest.findMany({
+      where: { ...reviewedWhere, status: { not: 'pending' } },
+      include: { customer: { select: { id: true, email: true } } },
+      orderBy: { reviewedAt: 'desc' },
+      take: 100,
+    }),
+  ]);
+
+  const entries = [
+    ...transactions.map((t) => ({
+      id: `txn-${t.id}`,
+      kind: 'points' as const,
+      type: t.type,
+      amount: t.amount,
+      note: t.note,
+      member: { id: t.wallet.customer.id, email: t.wallet.customer.email, memberId: formatMemberId(t.wallet.customer.id) },
+      createdAt: t.createdAt,
+    })),
+    ...reviewedRequests.map((r) => ({
+      id: `req-${r.id}`,
+      kind: 'certificate_request' as const,
+      status: r.status,
+      pointsCost: r.pointsCost,
+      adminNote: r.adminNote,
+      member: { id: r.customer.id, email: r.customer.email, memberId: formatMemberId(r.customer.id) },
+      createdAt: r.reviewedAt ?? r.createdAt,
+    })),
+  ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  return { entries };
+});
+
+// ---- Certificates — authenticated, owner-scoped only (search, scan-lookup, "My Certificates") ----
+//
+// There is deliberately no public/unauthenticated certificate lookup right
+// now. A certNo that exists but belongs to a different customer 404s exactly
+// the same as one that doesn't exist at all — that's not a bug, it's the
+// point: existence of another customer's certificate must never be
+// confirmable by someone who isn't its owner. If a public verification
+// feature is wanted later (e.g. for a buyer checking a stone that isn't
+// theirs), that should be a new, separate, explicitly-public endpoint —
+// not a relaxation of this one.
+app.get<{ Querystring: { certNo?: string; search?: string; limit?: string; offset?: string } }>(
+  '/customer/certificates',
+  async (request, reply) => {
+    const session = getCustomerSession(request);
+    if (!session) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    const customerId = Number(session.sub);
+    const { certNo, search } = request.query;
+
+    if (certNo) {
+      const certificate = await prisma.certificate.findFirst({
+        where: { certificateNo: certNo, customerId },
+        omit: { customerId: true },
+      });
+      if (!certificate) {
+        return reply.code(404).send({ error: 'Certificate not found' });
+      }
+      return certificate;
+    }
+
+    const limit = Math.min(Math.max(Number(request.query.limit) || 10, 1), 500);
+    const offset = Math.max(Number(request.query.offset) || 0, 0);
+    const where = {
+      customerId,
+      ...(search
+        ? {
+            OR: [
+              { certificateNo: { contains: search, mode: 'insensitive' as const } },
+              { identification: { contains: search, mode: 'insensitive' as const } },
+              { origin: { contains: search, mode: 'insensitive' as const } },
+            ],
+          }
+        : {}),
+    };
+
+    const [certificates, count] = await Promise.all([
+      prisma.certificate.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+        omit: { customerId: true },
+      }),
+      prisma.certificate.count({ where }),
+    ]);
+    return { certificates, count };
+  }
+);
+
+const port = Number(process.env.PORT) || 4000;
+app
+  .listen({ port, host: '0.0.0.0' })
+  .then(() => app.log.info(`mobile backend listening on :${port}`))
+  .catch((err) => {
+    app.log.error(err);
+    process.exit(1);
+  });

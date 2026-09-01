@@ -1,0 +1,182 @@
+// Was a mirror of web-internal/gv-certificate/prisma/schema.prisma against
+// the same shared database, with web-internal as the sole migration
+// authority. As of the standalone-hosting change, this backend runs against
+// its OWN independent database (see prisma/migrations/) and is its own
+// migration authority — it no longer shares data with web-internal at all.
+// The table shapes still happen to match (same starting schema), but the two
+// are now separate, unsynced datasets. See mobile-point/docs/DATA_MODEL.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  SUPERADMIN
+}
+
+model User {
+  id       Int    @id @default(autoincrement())
+  username String @unique
+  password String
+  role     Role   @default(ADMIN)
+
+  walletTransactions WalletTransaction[]
+  reviewedRequests   CertificateRequest[]
+}
+
+model Permission {
+  id              Int              @id @default(autoincrement())
+  key             String           @unique
+  description     String?
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  role         Role
+  permissionId Int
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([role, permissionId])
+  @@map("role_permissions")
+}
+
+model Certificate {
+  id             Int      @id @default(autoincrement())
+  certificateNo  String   @map("certificate_no")
+  issueDate      String   @map("issue_date")
+  identification String
+  pieces         String?
+  weight         String
+  dimensions     String?
+  cut            String?
+  shape          String?
+  color          String?
+  comment1       String?
+  comment2       String?
+  origin         String?
+  verifiedBy     String?  @map("verified_by")
+  certifiedBy    String?  @map("certified_by")
+  imageUrl       String?  @map("image_url")
+  signatureUrl   String?  @map("signature_url")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  customerId Int?      @map("customer_id")
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  walletTransactions WalletTransaction[]
+
+  @@index([certificateNo], map: "idx_certificate_no")
+  @@index([createdAt], map: "idx_created_at")
+  @@index([customerId], map: "idx_certificates_customer_id")
+  @@map("certificates")
+}
+
+model Customer {
+  id                  Int      @id @default(autoincrement())
+  email               String   @unique
+  password            String
+  freeCertificateCost Int?     @map("free_certificate_cost")
+  isAdmin             Boolean  @default(false) @map("is_admin")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  wallet                Wallet?
+  certificates          Certificate[]
+  otps                  CustomerOtp[]
+  certificateRequests   CertificateRequest[]  @relation("CertificateRequests")
+  initiatedTransactions WalletTransaction[]   @relation("InitiatedTransactions")
+  reviewedRequests      CertificateRequest[]  @relation("ReviewedRequests")
+
+  @@map("customers")
+}
+
+model SystemSetting {
+  id                  Int      @id @default(1)
+  freeCertificateCost Int      @default(100) @map("free_certificate_cost")
+  latestAppVersion    String   @default("1.0.0") @map("latest_app_version")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+model CertificateRequest {
+  id           Int       @id @default(autoincrement())
+  customerId   Int       @map("customer_id")
+  customer     Customer  @relation("CertificateRequests", fields: [customerId], references: [id], onDelete: Restrict)
+  pointsCost   Int       @map("points_cost")
+  status       String    @default("pending")
+  customerNote String?   @map("customer_note")
+  adminNote    String?   @map("admin_note")
+  reviewedBy   Int?      @map("reviewed_by")
+  reviewer     User?     @relation(fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewedByCustomerId Int?      @map("reviewed_by_customer_id")
+  reviewerCustomer     Customer? @relation("ReviewedRequests", fields: [reviewedByCustomerId], references: [id], onDelete: SetNull)
+  reviewedAt   DateTime? @map("reviewed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  walletTransactions WalletTransaction[]
+
+  @@index([customerId], map: "idx_certificate_requests_customer_id")
+  @@index([status], map: "idx_certificate_requests_status")
+  @@map("certificate_requests")
+}
+
+model CustomerOtp {
+  id         Int       @id @default(autoincrement())
+  customerId Int       @map("customer_id")
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  purpose    String
+  otpHash    String    @map("otp_hash")
+  newEmail   String?   @map("new_email")
+  expiresAt  DateTime  @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([customerId, purpose], map: "idx_customer_otps_customer_purpose")
+  @@map("customer_otps")
+}
+
+model Wallet {
+  id             Int      @id @default(autoincrement())
+  customerId     Int      @unique @map("customer_id")
+  customer       Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  balance        Int      @default(0)
+  lifetimeEarned Int      @default(0) @map("lifetime_earned")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  transactions WalletTransaction[]
+
+  @@map("wallets")
+}
+
+model WalletTransaction {
+  id            Int          @id @default(autoincrement())
+  walletId      Int          @map("wallet_id")
+  wallet        Wallet       @relation(fields: [walletId], references: [id], onDelete: Restrict)
+  type          String
+  amount        Int
+  balanceAfter  Int          @map("balance_after")
+  note          String
+  certificateId Int?         @map("certificate_id")
+  certificate   Certificate? @relation(fields: [certificateId], references: [id], onDelete: SetNull)
+  initiatedBy   Int?         @map("initiated_by")
+  initiator     User?        @relation(fields: [initiatedBy], references: [id], onDelete: SetNull)
+  initiatedByCustomerId Int?      @map("initiated_by_customer_id")
+  initiatorCustomer     Customer? @relation("InitiatedTransactions", fields: [initiatedByCustomerId], references: [id], onDelete: SetNull)
+  certificateRequestId Int?                @map("certificate_request_id")
+  certificateRequest   CertificateRequest? @relation(fields: [certificateRequestId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  @@index([walletId], map: "idx_wallet_transactions_wallet_id")
+  @@map("wallet_transactions")
+}
