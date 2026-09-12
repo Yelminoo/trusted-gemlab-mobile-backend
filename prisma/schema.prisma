@@ -81,13 +81,18 @@ model Certificate {
 }
 
 model Customer {
-  id                  Int      @id @default(autoincrement())
-  email               String   @unique
+  id                  Int       @id @default(autoincrement())
+  email               String    @unique
   password            String
-  freeCertificateCost Int?     @map("free_certificate_cost")
-  isAdmin             Boolean  @default(false) @map("is_admin")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  freeCertificateCost Int?      @map("free_certificate_cost")
+  isAdmin             Boolean   @default(false) @map("is_admin")
+  // Null until the account-creation OTP (purpose 'email_verification') is
+  // confirmed. Registration itself still succeeds and returns a usable
+  // session immediately — this is a "please verify" flag the client can
+  // show a reminder for, not a login gate.
+  emailVerifiedAt     DateTime? @map("email_verified_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
 
   wallet                Wallet?
   certificates          Certificate[]

@@ -129,11 +129,32 @@ app.post<{ Body: { email?: string; password?: string } }>('/customer/register', 
     },
   });
 
+  // Fire off the account-verification OTP — doesn't block/gate the response
+  // below, registration succeeds and returns a usable session immediately
+  // either way (see Customer.emailVerifiedAt's schema comment).
+  const otp = generateOtp();
+  await prisma.customerOtp.create({
+    data: {
+      customerId: customer.id,
+      purpose: 'email_verification',
+      otpHash: hashOtp(otp),
+      expiresAt: otpExpiresAt(),
+    },
+  });
+  sendOtpEmail(customer.email, otp, 'email_verification').catch((err) =>
+    app.log.error(err, 'failed to send email_verification OTP email')
+  );
+
   const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
   return reply.code(201).send({
     accessToken: signAccessToken(payload),
     refreshToken: signRefreshToken(payload),
-    customer: { id: customer.id, email: customer.email, isAdmin: customer.isAdmin },
+    customer: {
+      id: customer.id,
+      email: customer.email,
+      isAdmin: customer.isAdmin,
+      isEmailVerified: customer.emailVerifiedAt !== null,
+    },
   });
 });
 
@@ -152,7 +173,12 @@ app.post<{ Body: { email?: string; password?: string } }>('/customer/login', asy
   return {
     accessToken: signAccessToken(payload),
     refreshToken: signRefreshToken(payload),
-    customer: { id: customer.id, email: customer.email, isAdmin: customer.isAdmin },
+    customer: {
+      id: customer.id,
+      email: customer.email,
+      isAdmin: customer.isAdmin,
+      isEmailVerified: customer.emailVerifiedAt !== null,
+    },
   };
 });
 
@@ -216,7 +242,9 @@ app.post<{ Body: { email?: string } }>('/customer/password-reset/request', async
           expiresAt: otpExpiresAt(),
         },
       });
-      sendOtpEmail(customer.email, otp, 'password_reset');
+      sendOtpEmail(customer.email, otp, 'password_reset').catch((err) =>
+        app.log.error(err, 'failed to send password_reset OTP email')
+      );
     }
   }
 
@@ -295,7 +323,9 @@ app.post<{ Body: { newEmail?: string } }>('/customer/email-change/request', asyn
         expiresAt: otpExpiresAt(),
       },
     });
-    sendOtpEmail(newEmail, otp, 'email_change');
+    sendOtpEmail(newEmail, otp, 'email_change').catch((err) =>
+      app.log.error(err, 'failed to send email_change OTP email')
+    );
   }
 
   return { message: `A code has been sent to ${newEmail}.` };
@@ -331,7 +361,10 @@ app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (re
     const customer = await prisma.$transaction(async (tx) => {
       const updated = await tx.customer.update({
         where: { id: customerId },
-        data: { email: record.newEmail! },
+        // Confirming this OTP already proves ownership of the new address,
+        // same proof an /verify-email/confirm would give — so this counts
+        // as verified too, no need to make them verify it twice.
+        data: { email: record.newEmail!, emailVerifiedAt: new Date() },
       });
       await tx.customerOtp.updateMany({
         where: { customerId, purpose: 'email_change', usedAt: null },
@@ -339,7 +372,9 @@ app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (re
       });
       return updated;
     });
-    return { customer: { id: customer.id, email: customer.email } };
+    return {
+      customer: { id: customer.id, email: customer.email, isEmailVerified: customer.emailVerifiedAt !== null },
+    };
   } catch (error) {
     const code = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: string }).code : undefined;
     if (code === 'P2002') {
@@ -347,6 +382,90 @@ app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (re
     }
     throw error;
   }
+});
+
+// ---- Account email verification (authenticated — OTP sent at registration) ----
+//
+// Registration already sent one of these (see /customer/register). This is
+// just the resend + confirm pair, same shape as password-reset/email-change
+// above. Doesn't gate login/access — see Customer.emailVerifiedAt's comment.
+
+app.post('/customer/verify-email/request', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const customerId = Number(session.sub);
+
+  const customer = await prisma.customer.findUnique({ where: { id: customerId } });
+  if (!customer) {
+    return reply.code(404).send({ error: 'Customer not found' });
+  }
+  if (customer.emailVerifiedAt) {
+    return { message: 'Email already verified.' };
+  }
+
+  const recent = await prisma.customerOtp.findFirst({
+    where: { customerId, purpose: 'email_verification' },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!recent || !withinResendCooldown(recent.createdAt)) {
+    const otp = generateOtp();
+    await prisma.customerOtp.create({
+      data: {
+        customerId,
+        purpose: 'email_verification',
+        otpHash: hashOtp(otp),
+        expiresAt: otpExpiresAt(),
+      },
+    });
+    sendOtpEmail(customer.email, otp, 'email_verification').catch((err) =>
+      app.log.error(err, 'failed to send email_verification OTP email')
+    );
+  }
+
+  return { message: `A code has been sent to ${customer.email}.` };
+});
+
+app.post<{ Body: { otp?: string } }>('/customer/verify-email/confirm', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+
+  const { otp } = request.body ?? {};
+  if (!otp) {
+    return reply.code(400).send({ error: 'otp is required' });
+  }
+
+  const customerId = Number(session.sub);
+  const record = await prisma.customerOtp.findFirst({
+    where: {
+      customerId,
+      purpose: 'email_verification',
+      usedAt: null,
+      expiresAt: { gt: new Date() },
+      otpHash: hashOtp(otp),
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!record) {
+    return reply.code(400).send({ error: 'Invalid or expired code' });
+  }
+
+  const customer = await prisma.$transaction(async (tx) => {
+    const updated = await tx.customer.update({
+      where: { id: customerId },
+      data: { emailVerifiedAt: new Date() },
+    });
+    await tx.customerOtp.updateMany({
+      where: { customerId, purpose: 'email_verification', usedAt: null },
+      data: { usedAt: new Date() },
+    });
+    return updated;
+  });
+
+  return { customer: { id: customer.id, email: customer.email, isEmailVerified: true } };
 });
 
 // ---- Free certificate requests (customer side) ----

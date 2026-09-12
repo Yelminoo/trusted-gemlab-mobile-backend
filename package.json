@@ -14,7 +14,8 @@
     "@prisma/client": "^6.16.2",
     "bcryptjs": "^3.0.3",
     "fastify": "^5.2.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "resend": "^6.28.0"
   },
   "devDependencies": {
     "@types/jsonwebtoken": "^9.0.7",
