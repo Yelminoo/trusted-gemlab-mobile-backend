@@ -63,6 +63,46 @@ async function getEffectiveFreeCertificateCost(customerFreeCertificateCost: numb
   return setting.freeCertificateCost;
 }
 
+// Finds the most recent OTP record for this customer+purpose (regardless of
+// used/expired status) and updates it in place with a fresh code instead of
+// inserting a new row every time someone hits "resend" — customer_otps ends
+// up with one row per customer+purpose that just gets refreshed, rather than
+// accumulating a new row per resend. Returns null (does nothing) if the
+// existing record is still within the resend cooldown; the caller should
+// treat null the same as success (same generic response either way — this
+// mirrors the account-enumeration-safe pattern already used for the request
+// routes, just applied to "did we actually resend" too).
+async function issueOrRefreshOtp(
+  customerId: number,
+  purpose: string,
+  extra?: { newEmail: string }
+): Promise<string | null> {
+  const existing = await prisma.customerOtp.findFirst({
+    where: { customerId, purpose },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (existing && withinResendCooldown(existing.createdAt)) {
+    return null;
+  }
+
+  const otp = generateOtp();
+  const data = {
+    otpHash: hashOtp(otp),
+    expiresAt: otpExpiresAt(),
+    usedAt: null,
+    createdAt: new Date(),
+    ...(extra ? { newEmail: extra.newEmail } : {}),
+  };
+
+  if (existing) {
+    await prisma.customerOtp.update({ where: { id: existing.id }, data });
+  } else {
+    await prisma.customerOtp.create({ data: { customerId, purpose, ...data } });
+  }
+
+  return otp;
+}
+
 app.register(cors, { origin: true });
 
 app.get('/health', async () => {
@@ -228,20 +268,8 @@ app.post<{ Body: { email?: string } }>('/customer/password-reset/request', async
   // Always return the same generic response whether or not the email exists —
   // otherwise this endpoint becomes an account-enumeration oracle.
   if (customer) {
-    const recent = await prisma.customerOtp.findFirst({
-      where: { customerId: customer.id, purpose: 'password_reset' },
-      orderBy: { createdAt: 'desc' },
-    });
-    if (!recent || !withinResendCooldown(recent.createdAt)) {
-      const otp = generateOtp();
-      await prisma.customerOtp.create({
-        data: {
-          customerId: customer.id,
-          purpose: 'password_reset',
-          otpHash: hashOtp(otp),
-          expiresAt: otpExpiresAt(),
-        },
-      });
+    const otp = await issueOrRefreshOtp(customer.id, 'password_reset');
+    if (otp) {
       sendOtpEmail(customer.email, otp, 'password_reset').catch((err) =>
         app.log.error(err, 'failed to send password_reset OTP email')
       );
@@ -308,21 +336,8 @@ app.post<{ Body: { newEmail?: string } }>('/customer/email-change/request', asyn
   }
 
   const customerId = Number(session.sub);
-  const recent = await prisma.customerOtp.findFirst({
-    where: { customerId, purpose: 'email_change' },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (!recent || !withinResendCooldown(recent.createdAt)) {
-    const otp = generateOtp();
-    await prisma.customerOtp.create({
-      data: {
-        customerId,
-        purpose: 'email_change',
-        otpHash: hashOtp(otp),
-        newEmail,
-        expiresAt: otpExpiresAt(),
-      },
-    });
+  const otp = await issueOrRefreshOtp(customerId, 'email_change', { newEmail });
+  if (otp) {
     sendOtpEmail(newEmail, otp, 'email_change').catch((err) =>
       app.log.error(err, 'failed to send email_change OTP email')
     );
@@ -405,20 +420,8 @@ app.post('/customer/verify-email/request', async (request, reply) => {
     return { message: 'Email already verified.' };
   }
 
-  const recent = await prisma.customerOtp.findFirst({
-    where: { customerId, purpose: 'email_verification' },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (!recent || !withinResendCooldown(recent.createdAt)) {
-    const otp = generateOtp();
-    await prisma.customerOtp.create({
-      data: {
-        customerId,
-        purpose: 'email_verification',
-        otpHash: hashOtp(otp),
-        expiresAt: otpExpiresAt(),
-      },
-    });
+  const otp = await issueOrRefreshOtp(customerId, 'email_verification');
+  if (otp) {
     sendOtpEmail(customer.email, otp, 'email_verification').catch((err) =>
       app.log.error(err, 'failed to send email_verification OTP email')
     );

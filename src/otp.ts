@@ -3,7 +3,12 @@ import { Resend } from 'resend';
 
 const OTP_LENGTH = 6;
 export const OTP_TTL_MINUTES = 10;
-const RESEND_COOLDOWN_MS = 60_000;
+// Matches the mobile app's resend-button countdown (see
+// verify-email-banner.tsx etc.) — keep these in sync so the button
+// re-enabling actually corresponds to the server accepting a resend, rather
+// than the UI claiming you can resend while the backend silently no-ops.
+export const RESEND_COOLDOWN_SECONDS = 30;
+const RESEND_COOLDOWN_MS = RESEND_COOLDOWN_SECONDS * 1000;
 
 export function generateOtp(): string {
   return randomInt(0, 10 ** OTP_LENGTH).toString().padStart(OTP_LENGTH, '0');
