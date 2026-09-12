@@ -1,5 +1,4 @@
 import cors from '@fastify/cors';
-import { PrismaClient } from '@prisma/client';
 import Fastify, { FastifyRequest } from 'fastify';
 
 import {
@@ -12,8 +11,9 @@ import {
 } from './auth';
 import { formatMemberId, parseMemberId } from './memberId';
 import { generateOtp, hashOtp, otpExpiresAt, sendOtpEmail, withinResendCooldown } from './otp';
+import { broadcastNotification, notifyCustomer } from './push';
+import { prisma } from './prisma';
 
-const prisma = new PrismaClient();
 const app = Fastify({ logger: true });
 
 // Prevents the same logical action (issue/deduct points, review a
@@ -307,6 +307,54 @@ app.get('/customer/wallet', async (request, reply) => {
       createdAt: t.createdAt,
     })),
   };
+});
+
+// Registers (or re-registers) this device's Expo push token against the
+// signed-in customer. Idempotent by design: `token` is globally unique, so
+// re-sending the same token (app relaunch, token refresh callback firing
+// again) just no-ops the update rather than creating a duplicate row. If the
+// SAME token was previously registered to a DIFFERENT customer (e.g. one
+// device shared by two accounts, one logged out and another logged in), the
+// upsert re-points it to the new owner — the old owner shouldn't keep
+// getting notifications for a device they're no longer signed into.
+app.post<{ Body: { token?: string } }>('/customer/push-token', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const { token } = request.body ?? {};
+  if (!token || typeof token !== 'string') {
+    return reply.code(400).send({ error: 'token is required' });
+  }
+
+  await prisma.pushToken.upsert({
+    where: { token },
+    create: { token, customerId: Number(session.sub) },
+    update: { customerId: Number(session.sub) },
+  });
+
+  return { ok: true };
+});
+
+// Called on logout so a signed-out device stops receiving that account's
+// notifications immediately, rather than only when Expo eventually reports
+// the token as stale.
+app.delete<{ Body: { token?: string } }>('/customer/push-token', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const { token } = request.body ?? {};
+  if (!token || typeof token !== 'string') {
+    return reply.code(400).send({ error: 'token is required' });
+  }
+
+  // deleteMany (not delete) — if the token row is already gone, or belongs
+  // to a different customer for some reason, this is still a safe no-op
+  // rather than a 404/500 the client would need to handle specially.
+  await prisma.pushToken.deleteMany({ where: { token, customerId: Number(session.sub) } });
+
+  return { ok: true };
 });
 
 // ---- Password reset (no auth — proves identity via emailed OTP) ----
@@ -745,6 +793,16 @@ app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?
           return { wallet: updatedWallet, transaction };
         });
 
+        // Fire-and-forget — notifyCustomer never throws, so this can't turn
+        // a successful points update into a failed response.
+        void notifyCustomer(
+          customerId,
+          type === 'credit' ? 'Points received' : 'Points deducted',
+          type === 'credit'
+            ? `You received ${amount} points. New balance: ${result.wallet.balance}.`
+            : `${amount} points were deducted. New balance: ${result.wallet.balance}.`
+        );
+
         return {
           statusCode: 200,
           body: {
@@ -854,6 +912,14 @@ app.patch<{ Params: { id: string }; Body: { decision?: string; adminNote?: strin
           return certRequest;
         });
 
+        void notifyCustomer(
+          updated.customerId,
+          decision === 'approved' ? 'Certificate request approved' : 'Certificate request rejected',
+          decision === 'approved'
+            ? 'Your free certificate request was approved.'
+            : 'Your free certificate request was rejected.'
+        );
+
         return { statusCode: 200, body: { request: updated } };
       } catch (error) {
         if (error instanceof Error && error.message === 'REQUEST_NOT_FOUND') {
@@ -924,6 +990,30 @@ app.get('/admin/activity-log', async (request, reply) => {
   ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   return { entries };
+});
+
+// Sends one push notification to every device that's ever registered a
+// token — for announcing something to the whole customer base (a new
+// feature, scheduled maintenance) rather than something tied to one
+// customer's own action. Any staff session can trigger this; there's no
+// idempotency protection here on purpose — a double-tap sending the same
+// announcement twice is a mild annoyance, not a points/data bug, and admins
+// should be free to re-send the same announcement deliberately too.
+app.post<{ Body: { title?: string; body?: string } }>('/admin/notifications/broadcast', async (request, reply) => {
+  const session = await getStaffSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const { title, body } = request.body ?? {};
+  if (typeof title !== 'string' || !title.trim()) {
+    return reply.code(400).send({ error: 'title is required' });
+  }
+  if (typeof body !== 'string' || !body.trim()) {
+    return reply.code(400).send({ error: 'body is required' });
+  }
+
+  const { sent } = await broadcastNotification(title.trim(), body.trim());
+  return { sent };
 });
 
 // ---- Certificates — authenticated, owner-scoped only (search, scan-lookup, "My Certificates") ----

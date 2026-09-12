@@ -100,8 +100,26 @@ model Customer {
   certificateRequests   CertificateRequest[]  @relation("CertificateRequests")
   initiatedTransactions WalletTransaction[]   @relation("InitiatedTransactions")
   reviewedRequests      CertificateRequest[]  @relation("ReviewedRequests")
+  pushTokens            PushToken[]
 
   @@map("customers")
+}
+
+// One row per (customer, device). A customer can be signed in on more than
+// one device, so this is a table rather than a single column on Customer —
+// registering a new device just adds a row (upsert on the unique `token`),
+// and a token that Expo reports as no-longer-valid (device uninstalled the
+// app, etc.) is deleted rather than left to fail silently forever.
+model PushToken {
+  id         Int      @id @default(autoincrement())
+  customerId Int      @map("customer_id")
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  token      String   @unique
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([customerId], map: "idx_push_tokens_customer")
+  @@map("push_tokens")
 }
 
 model SystemSetting {
