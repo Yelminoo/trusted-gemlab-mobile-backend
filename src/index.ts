@@ -16,6 +16,61 @@ import { generateOtp, hashOtp, otpExpiresAt, sendOtpEmail, withinResendCooldown 
 const prisma = new PrismaClient();
 const app = Fastify({ logger: true });
 
+// Prevents the same logical action (issue/deduct points, review a
+// certificate request) from being applied twice — a double-tap firing two
+// requests before a button disables, or a client retrying a request whose
+// response got lost. See IdempotencyKey's schema comment for the race-safety
+// details (the row is reserved via a unique-constraint INSERT before the
+// mutation runs). `idempotencyKey` is optional — omitting it just runs the
+// handler with no dedup protection, so this never breaks a caller that
+// doesn't send one.
+type FastifyReplyLike = { code: (n: number) => unknown };
+// Body is deliberately `unknown` rather than a generic `T`: each call site's
+// handler returns a DIFFERENT shape per branch (success body vs `{error}`),
+// and trying to unify those under one type parameter fights TS inference for
+// no real benefit — this function's job is transport (cache/replay a status
+// + JSON body), not to validate any particular route's response shape. Each
+// route's own handler function is where that shape actually gets checked.
+async function withIdempotency(
+  reply: FastifyReplyLike,
+  idempotencyKey: string | string[] | undefined,
+  routeKey: string,
+  handler: () => Promise<{ statusCode: number; body: unknown }>
+): Promise<unknown> {
+  const key = Array.isArray(idempotencyKey) ? idempotencyKey[0] : idempotencyKey;
+  if (!key) {
+    const result = await handler();
+    reply.code(result.statusCode);
+    return result.body;
+  }
+
+  try {
+    await prisma.idempotencyKey.create({
+      data: { key, routeKey, statusCode: 0, response: {} },
+    });
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: string }).code : undefined;
+    if (code === 'P2002') {
+      const existing = await prisma.idempotencyKey.findUnique({ where: { key } });
+      if (existing && existing.routeKey === routeKey && existing.statusCode !== 0) {
+        reply.code(existing.statusCode);
+        return existing.response;
+      }
+      reply.code(409);
+      return { error: 'This request is already being processed.' };
+    }
+    throw error;
+  }
+
+  const result = await handler();
+  await prisma.idempotencyKey.update({
+    where: { key },
+    data: { statusCode: result.statusCode, response: result.body as object },
+  });
+  reply.code(result.statusCode);
+  return result.body;
+}
+
 function getCustomerSession(request: FastifyRequest) {
   const authHeader = request.headers.authorization;
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : null;
@@ -544,7 +599,13 @@ app.get<{ Querystring: { search?: string; memberId?: string } }>('/admin/members
       : search
         ? { email: { contains: search, mode: 'insensitive' } }
         : {},
-    select: { id: true, email: true, createdAt: true, wallet: { select: { balance: true, lifetimeEarned: true } } },
+    select: {
+      id: true,
+      email: true,
+      createdAt: true,
+      isAdmin: true,
+      wallet: { select: { balance: true, lifetimeEarned: true } },
+    },
     orderBy: { createdAt: 'desc' },
     take: 50,
   });
@@ -568,6 +629,7 @@ app.get<{ Params: { id: string } }>('/admin/members/:id', async (request, reply)
       id: true,
       email: true,
       freeCertificateCost: true,
+      isAdmin: true,
       wallet: {
         select: {
           balance: true,
@@ -587,6 +649,47 @@ app.get<{ Params: { id: string } }>('/admin/members/:id', async (request, reply)
     effectiveFreeCertificateCost: await getEffectiveFreeCertificateCost(customer.freeCertificateCost),
   };
 });
+
+// Grants/revokes admin access through the SAME customer session — see
+// Customer.isAdmin's schema comment. Any staff session can flip this for any
+// member (no separate role hierarchy in this app), with one guard: you can't
+// revoke your OWN admin access this way, so there's no way to accidentally
+// lock every admin out at once.
+app.patch<{ Params: { id: string }; Body: { isAdmin?: boolean } }>(
+  '/admin/members/:id/admin-status',
+  async (request, reply) => {
+    const session = await getStaffSession(request);
+    if (!session) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    const customerId = parseInt(request.params.id, 10);
+    if (isNaN(customerId)) {
+      return reply.code(400).send({ error: 'Invalid member id' });
+    }
+    const { isAdmin } = request.body ?? {};
+    if (typeof isAdmin !== 'boolean') {
+      return reply.code(400).send({ error: 'isAdmin must be a boolean' });
+    }
+    if (session.type === 'customer' && session.id === customerId && !isAdmin) {
+      return reply.code(400).send({ error: "You can't remove your own admin access." });
+    }
+
+    try {
+      const customer = await prisma.customer.update({
+        where: { id: customerId },
+        data: { isAdmin },
+        select: { id: true, email: true, isAdmin: true },
+      });
+      return { customer: { ...customer, memberId: formatMemberId(customer.id) } };
+    } catch (error) {
+      const code = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: string }).code : undefined;
+      if (code === 'P2025') {
+        return reply.code(404).send({ error: 'Member not found' });
+      }
+      throw error;
+    }
+  }
+);
 
 app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?: string } }>(
   '/admin/members/:id/points',
@@ -611,49 +714,54 @@ app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?
       return reply.code(400).send({ error: 'note is required' });
     }
 
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        const wallet = await tx.wallet.findUnique({ where: { customerId } });
-        if (!wallet) throw new Error('WALLET_NOT_FOUND');
+    return withIdempotency(reply, request.headers['idempotency-key'], 'admin_points', async () => {
+      try {
+        const result = await prisma.$transaction(async (tx) => {
+          const wallet = await tx.wallet.findUnique({ where: { customerId } });
+          if (!wallet) throw new Error('WALLET_NOT_FOUND');
 
-        const delta = type === 'credit' ? amount : -amount;
-        const newBalance = wallet.balance + delta;
-        if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
+          const delta = type === 'credit' ? amount : -amount;
+          const newBalance = wallet.balance + delta;
+          if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
 
-        const updatedWallet = await tx.wallet.update({
-          where: { id: wallet.id },
-          data: {
-            balance: newBalance,
-            lifetimeEarned: type === 'credit' ? wallet.lifetimeEarned + amount : wallet.lifetimeEarned,
-          },
+          const updatedWallet = await tx.wallet.update({
+            where: { id: wallet.id },
+            data: {
+              balance: newBalance,
+              lifetimeEarned: type === 'credit' ? wallet.lifetimeEarned + amount : wallet.lifetimeEarned,
+            },
+          });
+          const transaction = await tx.walletTransaction.create({
+            data: {
+              walletId: wallet.id,
+              type,
+              amount,
+              balanceAfter: newBalance,
+              note: note.trim(),
+              initiatedBy: session.type === 'admin' ? session.id : null,
+              initiatedByCustomerId: session.type === 'customer' ? session.id : null,
+            },
+          });
+          return { wallet: updatedWallet, transaction };
         });
-        const transaction = await tx.walletTransaction.create({
-          data: {
-            walletId: wallet.id,
-            type,
-            amount,
-            balanceAfter: newBalance,
-            note: note.trim(),
-            initiatedBy: session.type === 'admin' ? session.id : null,
-            initiatedByCustomerId: session.type === 'customer' ? session.id : null,
-          },
-        });
-        return { wallet: updatedWallet, transaction };
-      });
 
-      return {
-        wallet: { balance: result.wallet.balance, lifetimeEarned: result.wallet.lifetimeEarned },
-        transaction: result.transaction,
-      };
-    } catch (error) {
-      if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
-        return reply.code(404).send({ error: 'Member or wallet not found' });
+        return {
+          statusCode: 200,
+          body: {
+            wallet: { balance: result.wallet.balance, lifetimeEarned: result.wallet.lifetimeEarned },
+            transaction: result.transaction,
+          },
+        };
+      } catch (error) {
+        if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
+          return { statusCode: 404, body: { error: 'Member or wallet not found' } };
+        }
+        if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
+          return { statusCode: 400, body: { error: 'Insufficient balance for this deduction' } };
+        }
+        throw error;
       }
-      if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
-        return reply.code(400).send({ error: 'Insufficient balance for this deduction' });
-      }
-      throw error;
-    }
+    });
   }
 );
 
@@ -690,61 +798,79 @@ app.patch<{ Params: { id: string }; Body: { decision?: string; adminNote?: strin
       return reply.code(400).send({ error: 'decision must be "approved" or "rejected"' });
     }
 
-    try {
-      const updated = await prisma.$transaction(async (tx) => {
-        const certRequest = await tx.certificateRequest.findUnique({ where: { id: requestId } });
-        if (!certRequest) throw new Error('REQUEST_NOT_FOUND');
-        if (certRequest.status !== 'pending') throw new Error('ALREADY_REVIEWED');
-
-        if (decision === 'approved') {
-          const wallet = await tx.wallet.findUnique({ where: { customerId: certRequest.customerId } });
-          if (!wallet) throw new Error('WALLET_NOT_FOUND');
-          const newBalance = wallet.balance - certRequest.pointsCost;
-          if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
-
-          await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance } });
-          await tx.walletTransaction.create({
+    return withIdempotency(reply, request.headers['idempotency-key'], 'admin_review_request', async () => {
+      try {
+        const updated = await prisma.$transaction(async (tx) => {
+          // Atomically claim the request: this UPDATE's WHERE only matches
+          // a still-pending row, and Postgres serializes concurrent UPDATEs
+          // against the same row, so at most one of two racing requests can
+          // ever see count:1 here — closes a real double-approval race that
+          // the previous read-then-write (SELECT, then a separate UPDATE)
+          // could not: both could read status:'pending' before either
+          // committed, and both would then deduct points.
+          const claim = await tx.certificateRequest.updateMany({
+            where: { id: requestId, status: 'pending' },
             data: {
-              walletId: wallet.id,
-              type: 'debit',
-              amount: certRequest.pointsCost,
-              balanceAfter: newBalance,
-              note: 'Free certificate request approved',
-              certificateRequestId: certRequest.id,
-              initiatedBy: session.type === 'admin' ? session.id : null,
-              initiatedByCustomerId: session.type === 'customer' ? session.id : null,
+              status: decision,
+              adminNote: adminNote ?? null,
+              reviewedBy: session.type === 'admin' ? session.id : null,
+              reviewedByCustomerId: session.type === 'customer' ? session.id : null,
+              reviewedAt: new Date(),
             },
           });
-        }
+          if (claim.count === 0) {
+            const existing = await tx.certificateRequest.findUnique({ where: { id: requestId } });
+            if (!existing) throw new Error('REQUEST_NOT_FOUND');
+            throw new Error('ALREADY_REVIEWED');
+          }
 
-        return tx.certificateRequest.update({
-          where: { id: requestId },
-          data: {
-            status: decision,
-            adminNote: adminNote ?? null,
-            reviewedBy: session.type === 'admin' ? session.id : null,
-            reviewedByCustomerId: session.type === 'customer' ? session.id : null,
-            reviewedAt: new Date(),
-          },
+          const certRequest = await tx.certificateRequest.findUniqueOrThrow({ where: { id: requestId } });
+
+          if (decision === 'approved') {
+            const wallet = await tx.wallet.findUnique({ where: { customerId: certRequest.customerId } });
+            if (!wallet) throw new Error('WALLET_NOT_FOUND');
+            const newBalance = wallet.balance - certRequest.pointsCost;
+            if (newBalance < 0) throw new Error('INSUFFICIENT_BALANCE');
+
+            await tx.wallet.update({ where: { id: wallet.id }, data: { balance: newBalance } });
+            await tx.walletTransaction.create({
+              data: {
+                walletId: wallet.id,
+                type: 'debit',
+                amount: certRequest.pointsCost,
+                balanceAfter: newBalance,
+                note: 'Free certificate request approved',
+                certificateRequestId: certRequest.id,
+                initiatedBy: session.type === 'admin' ? session.id : null,
+                initiatedByCustomerId: session.type === 'customer' ? session.id : null,
+              },
+            });
+          }
+
+          // Throwing anywhere above rolls back the whole transaction,
+          // including the claim update — an insufficient-balance failure
+          // after claiming leaves the request back at 'pending' for a
+          // future retry, not stuck half-approved.
+          return certRequest;
         });
-      });
 
-      return { request: updated };
-    } catch (error) {
-      if (error instanceof Error && error.message === 'REQUEST_NOT_FOUND') {
-        return reply.code(404).send({ error: 'Request not found' });
+        return { statusCode: 200, body: { request: updated } };
+      } catch (error) {
+        if (error instanceof Error && error.message === 'REQUEST_NOT_FOUND') {
+          return { statusCode: 404, body: { error: 'Request not found' } };
+        }
+        if (error instanceof Error && error.message === 'ALREADY_REVIEWED') {
+          return { statusCode: 400, body: { error: 'Request was already reviewed' } };
+        }
+        if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
+          return { statusCode: 404, body: { error: 'Member wallet not found' } };
+        }
+        if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
+          return { statusCode: 400, body: { error: 'Member no longer has enough balance for this request' } };
+        }
+        throw error;
       }
-      if (error instanceof Error && error.message === 'ALREADY_REVIEWED') {
-        return reply.code(400).send({ error: 'Request was already reviewed' });
-      }
-      if (error instanceof Error && error.message === 'WALLET_NOT_FOUND') {
-        return reply.code(404).send({ error: 'Member wallet not found' });
-      }
-      if (error instanceof Error && error.message === 'INSUFFICIENT_BALANCE') {
-        return reply.code(400).send({ error: 'Member no longer has enough balance for this request' });
-      }
-      throw error;
-    }
+    });
   }
 );
 

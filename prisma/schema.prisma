@@ -185,3 +185,22 @@ model WalletTransaction {
   @@index([walletId], map: "idx_wallet_transactions_wallet_id")
   @@map("wallet_transactions")
 }
+
+// Prevents the same logical admin action (issue/deduct points, review a
+// certificate request) from being applied twice — e.g. a double-tap firing
+// two requests before the button disables, or a client retrying a request
+// whose response got lost on a flaky connection. The client sends an
+// Idempotency-Key header (one value per submission attempt, reused across
+// retries of that SAME attempt); the row is inserted BEFORE the mutation
+// runs, so a concurrent duplicate fails on the unique key and is rejected
+// rather than racing to also apply the mutation. statusCode 0 is a sentinel
+// meaning "still in flight" (row reserved, handler hasn't finished yet).
+model IdempotencyKey {
+  key        String   @id
+  routeKey   String   @map("route_key")
+  statusCode Int      @map("status_code")
+  response   Json
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("idempotency_keys")
+}
