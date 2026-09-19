@@ -101,6 +101,7 @@ model Customer {
   initiatedTransactions WalletTransaction[]   @relation("InitiatedTransactions")
   reviewedRequests      CertificateRequest[]  @relation("ReviewedRequests")
   pushTokens            PushToken[]
+  webPushSubscriptions  WebPushSubscription[]
 
   @@map("customers")
 }
@@ -120,6 +121,27 @@ model PushToken {
 
   @@index([customerId], map: "idx_push_tokens_customer")
   @@map("push_tokens")
+}
+
+// One row per browser subscription (trusted-gemlab-web) — the Web Push
+// equivalent of PushToken above, kept as its own table rather than
+// shoehorned into PushToken because the shape is fundamentally different:
+// a Web Push subscription is an endpoint URL + a pair of encryption keys
+// (p256dh/auth), not a single opaque token string. `endpoint` is unique for
+// the same reason `token` is on PushToken — re-subscribing the same
+// browser is a no-op upsert, not a duplicate row.
+model WebPushSubscription {
+  id         Int      @id @default(autoincrement())
+  customerId Int      @map("customer_id")
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  endpoint   String   @unique
+  p256dh     String
+  auth       String
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@index([customerId], map: "idx_web_push_subscriptions_customer")
+  @@map("web_push_subscriptions")
 }
 
 model SystemSetting {

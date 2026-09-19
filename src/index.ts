@@ -357,6 +357,50 @@ app.delete<{ Body: { token?: string } }>('/customer/push-token', async (request,
   return { ok: true };
 });
 
+// Web Push equivalent of the two routes above, for trusted-gemlab-web.
+// `endpoint` is unique per browser subscription the same way `token` is
+// for PushToken — re-subscribing the same browser upserts rather than
+// duplicating, and re-points ownership if it was previously subscribed
+// under a different signed-in customer on this device.
+app.post<{ Body: { endpoint?: string; keys?: { p256dh?: string; auth?: string } } }>(
+  '/customer/web-push/subscribe',
+  async (request, reply) => {
+    const session = getCustomerSession(request);
+    if (!session) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    const { endpoint, keys } = request.body ?? {};
+    if (!endpoint || typeof endpoint !== 'string' || !keys?.p256dh || !keys?.auth) {
+      return reply.code(400).send({ error: 'endpoint and keys.{p256dh,auth} are required' });
+    }
+
+    await prisma.webPushSubscription.upsert({
+      where: { endpoint },
+      create: { endpoint, p256dh: keys.p256dh, auth: keys.auth, customerId: Number(session.sub) },
+      update: { p256dh: keys.p256dh, auth: keys.auth, customerId: Number(session.sub) },
+    });
+
+    return { ok: true };
+  }
+);
+
+// Called on logout so a signed-out browser stops receiving that account's
+// notifications immediately.
+app.delete<{ Body: { endpoint?: string } }>('/customer/web-push/subscribe', async (request, reply) => {
+  const session = getCustomerSession(request);
+  if (!session) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  const { endpoint } = request.body ?? {};
+  if (!endpoint || typeof endpoint !== 'string') {
+    return reply.code(400).send({ error: 'endpoint is required' });
+  }
+
+  await prisma.webPushSubscription.deleteMany({ where: { endpoint, customerId: Number(session.sub) } });
+
+  return { ok: true };
+});
+
 // ---- Password reset (no auth — proves identity via emailed OTP) ----
 
 const GENERIC_REQUEST_MESSAGE = 'If that email is registered, a code has been sent.';
