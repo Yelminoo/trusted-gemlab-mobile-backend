@@ -84,6 +84,14 @@ model Customer {
   id                  Int       @id @default(autoincrement())
   email               String    @unique
   password            String
+  // Nullable at the DB level even though /customer/register requires it for
+  // every NEW registration (both mobile and web) — existing rows predate
+  // this field and can't be backfilled with a real name, so a NOT NULL
+  // column would've meant either a broken migration or a fake placeholder
+  // value. New registrations are validated at the API layer instead (see
+  // index.ts), which is the layer that actually needs to enforce it.
+  name                String?
+  phone               String?
   freeCertificateCost Int?      @map("free_certificate_cost")
   isAdmin             Boolean   @default(false) @map("is_admin")
   // Null until the account-creation OTP (purpose 'email_verification') is
@@ -91,6 +99,11 @@ model Customer {
   // session immediately — this is a "please verify" flag the client can
   // show a reminder for, not a login gate.
   emailVerifiedAt     DateTime? @map("email_verified_at")
+  // Set at registration when the required data-use consent checkbox was
+  // checked — /customer/register rejects the request outright if it
+  // wasn't, so on any row created after this field existed, a non-null
+  // value here is guaranteed. Null on rows that predate this requirement.
+  dataConsentAt       DateTime? @map("data_consent_at")
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 

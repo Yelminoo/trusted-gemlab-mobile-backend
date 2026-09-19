@@ -205,53 +205,70 @@ app.post<{ Body: { refreshToken?: string } }>('/auth/refresh', async (request, r
 
 // ---- Customer auth + wallet (mobile — docs/REQUIREMENTS.md 2.4) ----
 
-app.post<{ Body: { email?: string; password?: string } }>('/customer/register', async (request, reply) => {
-  const { email, password } = request.body ?? {};
-  if (!email || !password || password.length < 8) {
-    return reply.code(400).send({ error: 'email and a password of at least 8 characters are required' });
+app.post<{ Body: { email?: string; password?: string; name?: string; phone?: string; dataConsent?: boolean } }>(
+  '/customer/register',
+  async (request, reply) => {
+    const { email, password, name, phone, dataConsent } = request.body ?? {};
+    if (!email || !password || password.length < 8) {
+      return reply.code(400).send({ error: 'email and a password of at least 8 characters are required' });
+    }
+    if (!name || !name.trim()) {
+      return reply.code(400).send({ error: 'name is required' });
+    }
+    // Server-side, not just a UI nicety — a request that omits this or sends
+    // false is rejected outright, so this holds even against a direct API
+    // call that skips the client's own checkbox gate.
+    if (dataConsent !== true) {
+      return reply.code(400).send({ error: 'You must agree to the data use terms to register' });
+    }
+
+    const existing = await prisma.customer.findUnique({ where: { email } });
+    if (existing) {
+      return reply.code(409).send({ error: 'Email already registered' });
+    }
+
+    const customer = await prisma.customer.create({
+      data: {
+        email,
+        password: await hashPassword(password),
+        name: name.trim(),
+        phone: phone?.trim() || null,
+        dataConsentAt: new Date(),
+        wallet: { create: {} },
+      },
+    });
+
+    // Fire off the account-verification OTP — doesn't block/gate the
+    // response below, registration succeeds and returns a usable session
+    // immediately either way (see Customer.emailVerifiedAt's schema comment).
+    const otp = generateOtp();
+    await prisma.customerOtp.create({
+      data: {
+        customerId: customer.id,
+        purpose: 'email_verification',
+        otpHash: hashOtp(otp),
+        expiresAt: otpExpiresAt(),
+      },
+    });
+    sendOtpEmail(customer.email, otp, 'email_verification').catch((err) =>
+      app.log.error(err, 'failed to send email_verification OTP email')
+    );
+
+    const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
+    return reply.code(201).send({
+      accessToken: signAccessToken(payload),
+      refreshToken: signRefreshToken(payload),
+      customer: {
+        id: customer.id,
+        email: customer.email,
+        name: customer.name,
+        phone: customer.phone,
+        isAdmin: customer.isAdmin,
+        isEmailVerified: customer.emailVerifiedAt !== null,
+      },
+    });
   }
-
-  const existing = await prisma.customer.findUnique({ where: { email } });
-  if (existing) {
-    return reply.code(409).send({ error: 'Email already registered' });
-  }
-
-  const customer = await prisma.customer.create({
-    data: {
-      email,
-      password: await hashPassword(password),
-      wallet: { create: {} },
-    },
-  });
-
-  // Fire off the account-verification OTP — doesn't block/gate the response
-  // below, registration succeeds and returns a usable session immediately
-  // either way (see Customer.emailVerifiedAt's schema comment).
-  const otp = generateOtp();
-  await prisma.customerOtp.create({
-    data: {
-      customerId: customer.id,
-      purpose: 'email_verification',
-      otpHash: hashOtp(otp),
-      expiresAt: otpExpiresAt(),
-    },
-  });
-  sendOtpEmail(customer.email, otp, 'email_verification').catch((err) =>
-    app.log.error(err, 'failed to send email_verification OTP email')
-  );
-
-  const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
-  return reply.code(201).send({
-    accessToken: signAccessToken(payload),
-    refreshToken: signRefreshToken(payload),
-    customer: {
-      id: customer.id,
-      email: customer.email,
-      isAdmin: customer.isAdmin,
-      isEmailVerified: customer.emailVerifiedAt !== null,
-    },
-  });
-});
+);
 
 app.post<{ Body: { email?: string; password?: string } }>('/customer/login', async (request, reply) => {
   const { email, password } = request.body ?? {};
@@ -271,6 +288,8 @@ app.post<{ Body: { email?: string; password?: string } }>('/customer/login', asy
     customer: {
       id: customer.id,
       email: customer.email,
+      name: customer.name,
+      phone: customer.phone,
       isAdmin: customer.isAdmin,
       isEmailVerified: customer.emailVerifiedAt !== null,
     },
