@@ -203,6 +203,20 @@ app.post<{ Body: { refreshToken?: string } }>('/auth/refresh', async (request, r
   return { accessToken: signAccessToken(session) };
 });
 
+// The customer-session equivalent of the route above. Was missing entirely
+// until now — /customer/register and /customer/login always returned a
+// refreshToken (7d) alongside the 15-minute accessToken, but nothing ever
+// let a client actually use it, so a customer session silently died after
+// 15 minutes with no way to renew it short of a full re-login.
+app.post<{ Body: { refreshToken?: string } }>('/customer/refresh', async (request, reply) => {
+  const { refreshToken } = request.body ?? {};
+  const session = refreshToken ? verifyCustomerToken(refreshToken) : null;
+  if (!session) {
+    return reply.code(401).send({ error: 'Invalid or expired refresh token' });
+  }
+  return { accessToken: signAccessToken(session) };
+});
+
 // ---- Customer auth + wallet (mobile — docs/REQUIREMENTS.md 2.4) ----
 
 app.post<{ Body: { email?: string; password?: string; name?: string; phone?: string; dataConsent?: boolean } }>(
