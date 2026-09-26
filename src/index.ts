@@ -24,6 +24,7 @@ import {
   strikeIp,
   verifyTurnstile,
 } from './security';
+import { isValidPasswordLength, normalizeEmail, sanitizeText } from './validation';
 
 // trustProxy is required for request.ip to reflect the real client IP —
 // this process sits behind nginx (see ecosystem.config.js/deploy docs), so
@@ -302,12 +303,15 @@ app.post<{
       strikeIp(request.ip);
       return reply.code(400).send({ error: 'Verification failed — please try again' });
     }
-    if (!email || !password || password.length < 8) {
-      return reply.code(400).send({ error: 'email and a password of at least 8 characters are required' });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !password || !isValidPasswordLength(password) || password.length < 8) {
+      return reply.code(400).send({ error: 'A valid email and a password of at least 8 characters are required' });
     }
-    if (!name || !name.trim()) {
+    const sanitizedName = sanitizeText(name, 200);
+    if (!sanitizedName) {
       return reply.code(400).send({ error: 'name is required' });
     }
+    const sanitizedPhone = sanitizeText(phone, 40);
     // Server-side, not just a UI nicety — a request that omits this or sends
     // false is rejected outright, so this holds even against a direct API
     // call that skips the client's own checkbox gate.
@@ -315,17 +319,17 @@ app.post<{
       return reply.code(400).send({ error: 'You must agree to the data use terms to register' });
     }
 
-    const existing = await prisma.customer.findUnique({ where: { email } });
+    const existing = await prisma.customer.findUnique({ where: { email: normalizedEmail } });
     if (existing) {
       return reply.code(409).send({ error: 'Email already registered' });
     }
 
     const customer = await prisma.customer.create({
       data: {
-        email,
+        email: normalizedEmail,
         password: await hashPassword(password),
-        name: name.trim(),
-        phone: phone?.trim() || null,
+        name: sanitizedName,
+        phone: sanitizedPhone,
         dataConsentAt: new Date(),
         wallet: { create: {} },
       },
@@ -368,11 +372,12 @@ app.post<{ Body: { email?: string; password?: string } }>(
   { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
   async (request, reply) => {
     const { email, password } = request.body ?? {};
-    if (!email || !password) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !password) {
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
-    const customer = await prisma.customer.findUnique({ where: { email } });
+    const customer = await prisma.customer.findUnique({ where: { email: normalizedEmail } });
     if (!customer || !(await verifyPassword(password, customer.password))) {
       recordSecurityEvent('invalid_login', request.ip, { route: 'customer/login' });
       strikeIp(request.ip);
@@ -528,11 +533,12 @@ app.post<{ Body: { email?: string } }>(
   { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
   async (request, reply) => {
   const { email } = request.body ?? {};
-  if (!email) {
-    return reply.code(400).send({ error: 'email is required' });
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    return reply.code(400).send({ error: 'A valid email is required' });
   }
 
-  const customer = await prisma.customer.findUnique({ where: { email } });
+  const customer = await prisma.customer.findUnique({ where: { email: normalizedEmail } });
   // Always return the same generic response whether or not the email exists —
   // otherwise this endpoint becomes an account-enumeration oracle.
   if (customer) {
@@ -552,11 +558,12 @@ app.post<{ Body: { email?: string; otp?: string; newPassword?: string } }>(
   '/customer/password-reset/confirm',
   async (request, reply) => {
     const { email, otp, newPassword } = request.body ?? {};
-    if (!email || !otp || !newPassword || newPassword.length < 8) {
-      return reply.code(400).send({ error: 'email, otp, and a newPassword of at least 8 characters are required' });
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail || !otp || !newPassword || !isValidPasswordLength(newPassword) || newPassword.length < 8) {
+      return reply.code(400).send({ error: 'A valid email, otp, and a newPassword of at least 8 characters are required' });
     }
 
-    const customer = await prisma.customer.findUnique({ where: { email } });
+    const customer = await prisma.customer.findUnique({ where: { email: normalizedEmail } });
     const record = customer
       ? await prisma.customerOtp.findFirst({
           where: {
@@ -597,8 +604,9 @@ app.post<{ Body: { newEmail?: string } }>(
     return reply.code(401).send({ error: 'Unauthorized' });
   }
 
-  const { newEmail } = request.body ?? {};
-  if (!newEmail || !newEmail.includes('@')) {
+  const { newEmail: rawNewEmail } = request.body ?? {};
+  const newEmail = normalizeEmail(rawNewEmail);
+  if (!newEmail) {
     return reply.code(400).send({ error: 'A valid newEmail is required' });
   }
 
@@ -794,7 +802,7 @@ app.post<{ Body: { customerNote?: string } }>('/customer/certificate-requests', 
 
   const { customerNote } = request.body ?? {};
   const created = await prisma.certificateRequest.create({
-    data: { customerId, pointsCost: cost, customerNote: customerNote?.trim() || null },
+    data: { customerId, pointsCost: cost, customerNote: sanitizeText(customerNote, 500) },
   });
   return reply.code(201).send({ request: created });
 });
@@ -812,7 +820,13 @@ app.get<{ Querystring: { search?: string; memberId?: string } }>('/admin/members
     return reply.code(401).send({ error: 'Unauthorized' });
   }
 
-  const { search, memberId } = request.query;
+  // Capped before ever reaching a query — Prisma's `contains` is fully
+  // parameterized (no injection risk either way), but an unbounded-length
+  // string still means Postgres ILIKE-scanning every row against however
+  // much text someone sent; there's no legitimate reason a search term or
+  // member ID would ever need to be longer than this.
+  const search = sanitizeText(request.query.search, 100);
+  const memberId = sanitizeText(request.query.memberId, 100);
   const scannedId = memberId ? parseMemberId(memberId) : search ? parseMemberId(search) : null;
 
   const customers = await prisma.customer.findMany({
@@ -932,7 +946,8 @@ app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?
     if (typeof amount !== 'number' || !Number.isInteger(amount) || amount <= 0) {
       return reply.code(400).send({ error: 'amount must be a positive integer' });
     }
-    if (typeof note !== 'string' || !note.trim()) {
+    const sanitizedNote = sanitizeText(note, 500);
+    if (!sanitizedNote) {
       return reply.code(400).send({ error: 'note is required' });
     }
 
@@ -959,7 +974,7 @@ app.post<{ Params: { id: string }; Body: { type?: string; amount?: number; note?
               type,
               amount,
               balanceAfter: newBalance,
-              note: note.trim(),
+              note: sanitizedNote,
               initiatedBy: session.type === 'admin' ? session.id : null,
               initiatedByCustomerId: session.type === 'customer' ? session.id : null,
             },
@@ -1025,10 +1040,11 @@ app.patch<{ Params: { id: string }; Body: { decision?: string; adminNote?: strin
     if (isNaN(requestId)) {
       return reply.code(400).send({ error: 'Invalid request id' });
     }
-    const { decision, adminNote } = request.body ?? {};
+    const { decision, adminNote: rawAdminNote } = request.body ?? {};
     if (decision !== 'approved' && decision !== 'rejected') {
       return reply.code(400).send({ error: 'decision must be "approved" or "rejected"' });
     }
+    const adminNote = sanitizeText(rawAdminNote, 500);
 
     return withIdempotency(reply, request.headers['idempotency-key'], 'admin_review_request', async () => {
       try {
@@ -1044,7 +1060,7 @@ app.patch<{ Params: { id: string }; Body: { decision?: string; adminNote?: strin
             where: { id: requestId, status: 'pending' },
             data: {
               status: decision,
-              adminNote: adminNote ?? null,
+              adminNote,
               reviewedBy: session.type === 'admin' ? session.id : null,
               reviewedByCustomerId: session.type === 'customer' ? session.id : null,
               reviewedAt: new Date(),
@@ -1178,15 +1194,16 @@ app.post<{ Body: { title?: string; body?: string } }>('/admin/notifications/broa
   if (!session) {
     return reply.code(401).send({ error: 'Unauthorized' });
   }
-  const { title, body } = request.body ?? {};
-  if (typeof title !== 'string' || !title.trim()) {
+  const sanitizedTitle = sanitizeText(request.body?.title, 65);
+  const sanitizedBody = sanitizeText(request.body?.body, 500);
+  if (!sanitizedTitle) {
     return reply.code(400).send({ error: 'title is required' });
   }
-  if (typeof body !== 'string' || !body.trim()) {
+  if (!sanitizedBody) {
     return reply.code(400).send({ error: 'body is required' });
   }
 
-  const { sent } = await broadcastNotification(title.trim(), body.trim());
+  const { sent } = await broadcastNotification(sanitizedTitle, sanitizedBody);
   return { sent };
 });
 
@@ -1208,7 +1225,8 @@ app.get<{ Querystring: { certNo?: string; search?: string; limit?: string; offse
       return reply.code(401).send({ error: 'Unauthorized' });
     }
     const customerId = Number(session.sub);
-    const { certNo, search } = request.query;
+    const certNo = sanitizeText(request.query.certNo, 100);
+    const search = sanitizeText(request.query.search, 100);
 
     if (certNo) {
       const certificate = await prisma.certificate.findFirst({
