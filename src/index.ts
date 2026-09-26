@@ -1,4 +1,6 @@
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import rateLimit from '@fastify/rate-limit';
 import Fastify, { FastifyRequest } from 'fastify';
 
 import {
@@ -13,8 +15,22 @@ import { formatMemberId, parseMemberId } from './memberId';
 import { generateOtp, hashOtp, otpExpiresAt, sendOtpEmail, withinResendCooldown } from './otp';
 import { broadcastNotification, notifyCustomer } from './push';
 import { prisma } from './prisma';
+import {
+  corsOptions,
+  isHoneypotTripped,
+  isIpBanned,
+  recordSecurityEvent,
+  SENSITIVE_RATE_LIMIT,
+  strikeIp,
+  verifyTurnstile,
+} from './security';
 
-const app = Fastify({ logger: true });
+// trustProxy is required for request.ip to reflect the real client IP —
+// this process sits behind nginx (see ecosystem.config.js/deploy docs), so
+// without it every request would appear to come from nginx's own loopback
+// address, making IP-based rate limiting and the ban list below useless
+// (every visitor would look identical and share one bucket/ban).
+const app = Fastify({ logger: true, trustProxy: true });
 
 // Prevents the same logical action (issue/deduct points, review a
 // certificate request) from being applied twice — a double-tap firing two
@@ -158,7 +174,40 @@ async function issueOrRefreshOtp(
   return otp;
 }
 
-app.register(cors, { origin: true });
+app.register(cors, corsOptions);
+
+// crossOriginResourcePolicy must be 'cross-origin', not helmet's default
+// 'same-origin' — this API is deliberately fetched from a different origin
+// (point.trustedgemlab.com), and the default would make browsers block
+// those responses client-side even though CORS itself allows them (CORP is
+// enforced independently of CORS headers).
+app.register(helmet, { crossOriginResourcePolicy: { policy: 'cross-origin' } });
+
+// Global default — generous enough not to bother normal use (dashboard
+// polling, admin search-as-you-type), just a backstop against abuse.
+// Genuinely sensitive routes (register, login, anything that sends an
+// email) get a much stricter limit individually — see SENSITIVE_RATE_LIMIT.
+app.register(rateLimit, { max: 100, timeWindow: '1 minute' });
+
+// Every response here is either account/wallet/admin data or an
+// auth-adjacent response — none of it should ever be cached by a browser,
+// a shared proxy, or Cloudflare's edge cache. There's no static/public
+// content served from this API that would benefit from caching.
+app.addHook('onSend', async (request, reply, payload) => {
+  reply.header('Cache-Control', 'no-store');
+  return payload;
+});
+
+// Runs before every route — an IP that's been struck enough times (tripped
+// a honeypot, failed several logins, failed Turnstile) gets a flat 403
+// instead of ever reaching route logic, for the remainder of its ban
+// window. See security.ts for how strikes/bans are recorded.
+app.addHook('onRequest', async (request, reply) => {
+  if (isIpBanned(request.ip)) {
+    recordSecurityEvent('banned_ip_blocked', request.ip, { url: request.url });
+    return reply.code(403).send({ error: 'Forbidden' });
+  }
+});
 
 app.get('/health', async () => {
   await prisma.$queryRaw`SELECT 1`;
@@ -175,7 +224,10 @@ app.get('/app-version', async () => {
 
 // ---- Admin auth (backend implemented; no mobile screen yet, see docs/REQUIREMENTS.md 2.1) ----
 
-app.post<{ Body: { username?: string; password?: string } }>('/auth/login', async (request, reply) => {
+app.post<{ Body: { username?: string; password?: string } }>(
+  '/auth/login',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
+  async (request, reply) => {
   const { username, password } = request.body ?? {};
   if (!username || !password) {
     return reply.code(401).send({ error: 'Invalid credentials' });
@@ -183,6 +235,8 @@ app.post<{ Body: { username?: string; password?: string } }>('/auth/login', asyn
 
   const user = await prisma.user.findUnique({ where: { username } });
   if (!user || !(await verifyPassword(password, user.password))) {
+    recordSecurityEvent('invalid_login', request.ip, { route: 'auth/login' });
+    strikeIp(request.ip);
     return reply.code(401).send({ error: 'Invalid credentials' });
   }
 
@@ -192,7 +246,8 @@ app.post<{ Body: { username?: string; password?: string } }>('/auth/login', asyn
     refreshToken: signRefreshToken(payload),
     user: { id: user.id, username: user.username, role: user.role },
   };
-});
+  }
+);
 
 app.post<{ Body: { refreshToken?: string } }>('/auth/refresh', async (request, reply) => {
   const { refreshToken } = request.body ?? {};
@@ -219,10 +274,34 @@ app.post<{ Body: { refreshToken?: string } }>('/customer/refresh', async (reques
 
 // ---- Customer auth + wallet (mobile — docs/REQUIREMENTS.md 2.4) ----
 
-app.post<{ Body: { email?: string; password?: string; name?: string; phone?: string; dataConsent?: boolean } }>(
+app.post<{
+  Body: {
+    email?: string;
+    password?: string;
+    name?: string;
+    phone?: string;
+    dataConsent?: boolean;
+    website?: string; // honeypot — see isHoneypotTripped's comment. Real clients never send this.
+    turnstileToken?: string;
+  };
+}>(
   '/customer/register',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
   async (request, reply) => {
-    const { email, password, name, phone, dataConsent } = request.body ?? {};
+    const { email, password, name, phone, dataConsent, website, turnstileToken } = request.body ?? {};
+
+    if (isHoneypotTripped(website)) {
+      recordSecurityEvent('honeypot_tripped', request.ip, { route: 'customer/register' });
+      strikeIp(request.ip);
+      // Looks like an ordinary validation failure to whatever submitted
+      // this — no signal that a honeypot specifically caught it.
+      return reply.code(400).send({ error: 'Something went wrong' });
+    }
+    if (!(await verifyTurnstile(turnstileToken, request.ip))) {
+      recordSecurityEvent('turnstile_failed', request.ip, { route: 'customer/register' });
+      strikeIp(request.ip);
+      return reply.code(400).send({ error: 'Verification failed — please try again' });
+    }
     if (!email || !password || password.length < 8) {
       return reply.code(400).send({ error: 'email and a password of at least 8 characters are required' });
     }
@@ -284,31 +363,37 @@ app.post<{ Body: { email?: string; password?: string; name?: string; phone?: str
   }
 );
 
-app.post<{ Body: { email?: string; password?: string } }>('/customer/login', async (request, reply) => {
-  const { email, password } = request.body ?? {};
-  if (!email || !password) {
-    return reply.code(401).send({ error: 'Invalid credentials' });
-  }
+app.post<{ Body: { email?: string; password?: string } }>(
+  '/customer/login',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
+  async (request, reply) => {
+    const { email, password } = request.body ?? {};
+    if (!email || !password) {
+      return reply.code(401).send({ error: 'Invalid credentials' });
+    }
 
-  const customer = await prisma.customer.findUnique({ where: { email } });
-  if (!customer || !(await verifyPassword(password, customer.password))) {
-    return reply.code(401).send({ error: 'Invalid credentials' });
-  }
+    const customer = await prisma.customer.findUnique({ where: { email } });
+    if (!customer || !(await verifyPassword(password, customer.password))) {
+      recordSecurityEvent('invalid_login', request.ip, { route: 'customer/login' });
+      strikeIp(request.ip);
+      return reply.code(401).send({ error: 'Invalid credentials' });
+    }
 
-  const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
-  return {
-    accessToken: signAccessToken(payload),
-    refreshToken: signRefreshToken(payload),
-    customer: {
-      id: customer.id,
-      email: customer.email,
-      name: customer.name,
-      phone: customer.phone,
-      isAdmin: customer.isAdmin,
-      isEmailVerified: customer.emailVerifiedAt !== null,
-    },
-  };
-});
+    const payload = { kind: 'customer' as const, sub: String(customer.id), email: customer.email };
+    return {
+      accessToken: signAccessToken(payload),
+      refreshToken: signRefreshToken(payload),
+      customer: {
+        id: customer.id,
+        email: customer.email,
+        name: customer.name,
+        phone: customer.phone,
+        isAdmin: customer.isAdmin,
+        isEmailVerified: customer.emailVerifiedAt !== null,
+      },
+    };
+  }
+);
 
 app.get('/customer/wallet', async (request, reply) => {
   const session = getCustomerSession(request);
@@ -438,7 +523,10 @@ app.delete<{ Body: { endpoint?: string } }>('/customer/web-push/subscribe', asyn
 
 const GENERIC_REQUEST_MESSAGE = 'If that email is registered, a code has been sent.';
 
-app.post<{ Body: { email?: string } }>('/customer/password-reset/request', async (request, reply) => {
+app.post<{ Body: { email?: string } }>(
+  '/customer/password-reset/request',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
+  async (request, reply) => {
   const { email } = request.body ?? {};
   if (!email) {
     return reply.code(400).send({ error: 'email is required' });
@@ -457,7 +545,8 @@ app.post<{ Body: { email?: string } }>('/customer/password-reset/request', async
   }
 
   return { message: GENERIC_REQUEST_MESSAGE };
-});
+  }
+);
 
 app.post<{ Body: { email?: string; otp?: string; newPassword?: string } }>(
   '/customer/password-reset/confirm',
@@ -499,7 +588,10 @@ app.post<{ Body: { email?: string; otp?: string; newPassword?: string } }>(
 
 // ---- Email change (authenticated — OTP sent to the NEW address to prove ownership) ----
 
-app.post<{ Body: { newEmail?: string } }>('/customer/email-change/request', async (request, reply) => {
+app.post<{ Body: { newEmail?: string } }>(
+  '/customer/email-change/request',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
+  async (request, reply) => {
   const session = getCustomerSession(request);
   if (!session) {
     return reply.code(401).send({ error: 'Unauthorized' });
@@ -524,7 +616,8 @@ app.post<{ Body: { newEmail?: string } }>('/customer/email-change/request', asyn
   }
 
   return { message: `A code has been sent to ${newEmail}.` };
-});
+  }
+);
 
 app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (request, reply) => {
   const session = getCustomerSession(request);
@@ -585,7 +678,10 @@ app.post<{ Body: { otp?: string } }>('/customer/email-change/confirm', async (re
 // just the resend + confirm pair, same shape as password-reset/email-change
 // above. Doesn't gate login/access — see Customer.emailVerifiedAt's comment.
 
-app.post('/customer/verify-email/request', async (request, reply) => {
+app.post(
+  '/customer/verify-email/request',
+  { config: { rateLimit: SENSITIVE_RATE_LIMIT } },
+  async (request, reply) => {
   const session = getCustomerSession(request);
   if (!session) {
     return reply.code(401).send({ error: 'Unauthorized' });
@@ -608,7 +704,8 @@ app.post('/customer/verify-email/request', async (request, reply) => {
   }
 
   return { message: `A code has been sent to ${customer.email}.` };
-});
+  }
+);
 
 app.post<{ Body: { otp?: string } }>('/customer/verify-email/confirm', async (request, reply) => {
   const session = getCustomerSession(request);
